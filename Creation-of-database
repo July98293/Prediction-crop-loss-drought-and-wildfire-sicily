@@ -1,0 +1,124 @@
+// ============================================
+// SICILIA – Drought + NDVI stress + Wildfires
+// MODIS NDVI + CHIRPS + MODIS Burned Area
+// ============================================
+
+// ---- PARAMETRI
+var startYear = 2003;
+var endYear   = 2024;
+
+// Stagione agricola media Sicilia
+var seasonStartMonth = 3;  // Marzo
+var seasonEndMonth   = 9;  // Settembre
+
+// ---- REGIONE: SICILIA
+var regions = ee.FeatureCollection("FAO/GAUL/2015/level1")
+  .filter(ee.Filter.and(
+    ee.Filter.eq("ADM0_NAME", "Italy"),
+    ee.Filter.eq("ADM1_NAME", "Sicilia")
+  ));
+
+Map.centerObject(regions, 6);
+Map.addLayer(regions, {}, "Sicilia");
+
+// ---- NDVI MODIS
+var ndviIC = ee.ImageCollection("MODIS/061/MOD13Q1")
+  .select(["NDVI", "SummaryQA"])
+  .map(function(img){
+    var qa = img.select("SummaryQA");
+    var good = qa.lte(1);
+    return img.select("NDVI")
+      .multiply(0.0001)
+      .updateMask(good)
+      .copyProperties(img, ["system:time_start"]);
+  });
+
+// ---- PRECIPITAZIONE CHIRPS
+var precipIC = ee.ImageCollection("UCSB-CHG/CHIRPS/DAILY")
+  .select("precipitation");
+
+// ---- INCENDI MODIS (area bruciata)
+var fireIC = ee.ImageCollection("MODIS/061/MCD64A1")
+  .select("BurnDate"); // >0 = bruciato
+
+// ---- LISTA ANNI
+var years = ee.List.sequence(startYear, endYear);
+
+// ---- FUNZIONE STAGIONE
+function seasonRange(y){
+  y = ee.Number(y);
+  return {
+    start: ee.Date.fromYMD(y, seasonStartMonth, 1),
+    end:   ee.Date.fromYMD(y, seasonEndMonth, 30)
+  };
+}
+
+// ---- BASELINE (climatologia)
+var ndviBaseline = ee.ImageCollection(
+  years.map(function(y){
+    var r = seasonRange(y);
+    return ndviIC.filterDate(r.start, r.end).mean();
+  })
+).mean();
+
+var precipBaseline = ee.ImageCollection(
+  years.map(function(y){
+    var r = seasonRange(y);
+    return precipIC.filterDate(r.start, r.end).sum();
+  })
+).mean();
+
+// ---- FEATURE PER ANNO
+function featuresPerYear(y){
+  y = ee.Number(y);
+  var r = seasonRange(y);
+
+  // NDVI
+  var ndviMean = ndviIC.filterDate(r.start, r.end).mean();
+  var ndviMin  = ndviIC.filterDate(r.start, r.end).min();
+  var ndviAnom = ndviMean.subtract(ndviBaseline);
+
+  // Precip
+  var precipSum = precipIC.filterDate(r.start, r.end).sum();
+  var precipAnom = precipSum.subtract(precipBaseline);
+
+  // Incendi
+  var fireSeason = fireIC.filterDate(r.start, r.end)
+    .map(function(img){
+      return img.gt(0);
+    });
+
+  var burnedArea = fireSeason.sum(); // pixel count bruciati
+
+  // Stack
+  var stack = ee.Image.cat([
+    ndviMean.rename("ndvi_mean"),
+    ndviMin.rename("ndvi_min"),
+    ndviAnom.rename("ndvi_anomaly"),
+    precipSum.rename("precip_sum"),
+    precipAnom.rename("precip_anomaly"),
+    burnedArea.rename("burned_pixels")
+  ]);
+
+  // Riduzione su Sicilia
+  var stats = stack.reduceRegion({
+    reducer: ee.Reducer.mean(),
+    geometry: regions.geometry(),
+    scale: 250,
+    bestEffort: true
+  });
+
+  return ee.Feature(null, stats).set("year", y);
+}
+
+// ---- COSTRUISCI TABELLA
+var table = ee.FeatureCollection(years.map(featuresPerYear));
+
+print("Sicilia dataset", table);
+
+// ---- EXPORT CSV
+Export.table.toDrive({
+  collection: table,
+  description: "sicilia_drought_ndvi_precip_fire",
+  fileFormat: "CSV"
+});
